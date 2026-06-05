@@ -55,6 +55,10 @@ Edit the config block at the top of [`cyclone_track.py`](cyclone_track.py):
 | `MODEL` | single model: `"fcn"` \| `"pangu"` \| `"sfno"` \| `"aurora"` |
 | `COMPARE` | list to overlay several models, e.g. `["fcn", "pangu"]` (`[]` = just `MODEL`) |
 | `INTENSITY` | `True` → also plot min-pressure / max-wind of the primary storm |
+| `STRENGTH` | `True` → color track markers by Saffir-Simpson category |
+| `CATEGORY` | `"estimate"` = ballpark Vmax from central-pressure depth (resolution-corrected) · `"wind"` = raw model 10 m wind (~2–3 cats low) |
+| `INTENSITY_GAIN` | (estimate mode) MSLP-deficit gain; `~2.0` lands Milton near Cat 4 |
+| `VORT_THRESHOLD` | detection sensitivity (850 hPa vorticity, default `1e-4`); **lower = lock onto weaker lows**, higher = only strong storms |
 | `DATA_SOURCE` | `"gfs"` (live, ~2021→now) or `"arco"` (ERA5, any historical date) |
 | `START_TIME` | init time; GFS only has 00/06/12/18Z cycles |
 | `NSTEPS` | forecast steps (6 h each; 16 = 4 days, 40 = 10 days) |
@@ -112,11 +116,19 @@ These were the non-obvious fixes — keep them if you rebuild the env:
 | **Aurora** (0.25°) | ❌ ~24 GB+ | best TC model; activation-bound, offload doesn't help |
 | **GraphCast / GenCast** | ⚠️ | JAX on CUDA-13; heavier |
 
-## Note on intensity
+## Note on intensity (and the `CATEGORY` estimate)
 
-AI models track cyclones well but **systematically under-deepen** them: in the Milton
-demo the GFS analysis bottomed near ~942 hPa / 78 kt while FCN and Pangu kept it near
-~1000 hPa / 30 kt. Treat the intensity panel as *relative* guidance, not a Cat rating.
+A 0.25° grid can't resolve a hurricane core, so **both the model *and* the GFS analysis
+under-deepen storms**. For Hurricane Milton (real peak ~897 hPa / 160 kt, Cat 5) the
+tracker recorded the *GFS analysis* at only **961 hPa / 85 kt** and the *FCN forecast* at
+**996 hPa / 31 kt** — so raw winds read ~2–3 categories low *even for the "truth"*.
+
+`CATEGORY="estimate"` (default) gives a ballpark by inflating the central-pressure deficit
+(`INTENSITY_GAIN`) and applying the **Atkinson–Holliday** wind–pressure relation; its 0.644
+power keeps shallow lows weak and boosts deep storms more. That puts Milton's analysis at
+~**Cat 4** and FCN at ~**TS** (still honestly weaker). It's a rough estimate, **not a
+calibrated forecast** — for real verification of a past storm, compare to NHC best track.
+Use `CATEGORY="wind"` for the raw, honest-but-low model wind.
 
 ## Ideas to extend
 

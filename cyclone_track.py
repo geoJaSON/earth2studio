@@ -40,15 +40,21 @@ import torch
 # ----------------------------------------------------------------------------
 # Configuration -- edit these (or override with WX_* env vars)
 # ----------------------------------------------------------------------------
-MODEL       = "pangu"           # single model: "fcn" | "pangu" | "sfno" | "aurora"
+MODEL       = "fcn"           # single model: "fcn" | "pangu" | "sfno" | "aurora"
 COMPARE     = []              # e.g. ["fcn", "pangu"] to overlay several models; [] -> just MODEL
 INTENSITY   = True            # also plot storm intensity (min pressure / max wind)
 USE_BF16    = True            # run torch models under bfloat16 autocast
 DATA_SOURCE = "gfs"           # "gfs" (live NOAA, archive ~2021->now) or "arco" (ERA5)
-START_TIME  = datetime(2026, 6, 5, 0)   # init time; GFS has 00/06/12/18Z cycles
+START_TIME  = datetime(2026, 6, 5, 12)   # init time; GFS has 00/06/12/18Z cycles
 NSTEPS      = 20              # forecast steps; 6h each -> 16 = 4 days, 40 = 10 days
 TRACK_TRUTH = False           # overlay analysis "truth" (only for past windows)
 MAP_EXTENT  = [-100, -78, 17, 32]    # [lon_min, lon_max, lat_min, lat_max] in [-180,180]
+VORT_THRESHOLD = 1.0e-4       # detection sensitivity (850 hPa vorticity, s^-1): LOWER = lock
+                              # onto weaker/earlier lows (more false alarms); HIGHER = only strong
+STRENGTH    = True            # color track markers by Saffir-Simpson category
+CATEGORY    = "estimate"      # "estimate" = ballpark Vmax from central-pressure depth (undoes
+                              #   0.25deg smoothing); "wind" = raw model 10m wind (~2-3 cats low)
+INTENSITY_GAIN = 2.0          # ["estimate" only] MSLP-deficit gain; ~2.0 lands Milton near Cat 4
 
 # --- optional env overrides (don't edit) ---
 MODEL       = os.environ.get("WX_MODEL", MODEL)
@@ -61,6 +67,10 @@ if os.environ.get("WX_START"):
     START_TIME = datetime.fromisoformat(os.environ["WX_START"])
 if os.environ.get("WX_EXTENT"):
     MAP_EXTENT = [float(v) for v in os.environ["WX_EXTENT"].split(",")]
+VORT_THRESHOLD = float(os.environ.get("WX_VORT", VORT_THRESHOLD))
+STRENGTH    = os.environ.get("WX_STRENGTH", str(STRENGTH)) == "True"
+CATEGORY    = os.environ.get("WX_CATEGORY", CATEGORY)
+INTENSITY_GAIN = float(os.environ.get("WX_GAIN", INTENSITY_GAIN))
 # ----------------------------------------------------------------------------
 
 os.makedirs("outputs", exist_ok=True)
@@ -125,6 +135,60 @@ def _patch_ort_low_vram():
 
 
 _patch_ort_low_vram()
+
+
+class SensitiveTCTracker(TCTrackerWuDuan):
+    """TCTrackerWuDuan with an adjustable 850 hPa vorticity detection threshold.
+    The base class calls `_find_centers(...)` with no override, so its hardcoded 1e-4
+    default always applies; here we expose it as a constructor arg to tune sensitivity.
+    (Track-linking knobs `path_search_distance`/`path_search_window_size` are left at
+    their defaults — pass them through **kw if you ever want to tune those too.)"""
+
+    def __init__(self, vort_threshold=1.0e-4, **kw):
+        super().__init__(**kw)
+        self.vort_threshold = float(vort_threshold)
+
+    def _find_centers(self, lat, lon, vort850, w10m, msl, vort850_threshold=None):
+        if vort850_threshold is None:
+            vort850_threshold = torch.tensor(self.vort_threshold)
+        return super()._find_centers(lat, lon, vort850, w10m, msl, vort850_threshold)
+
+
+# Saffir-Simpson scale: (min sustained 10 m wind in KNOTS, label, color). Strong -> weak.
+SAFFIR = [
+    (137, "Cat 5", "#a020f0"),
+    (113, "Cat 4", "#ff3030"),
+    (96,  "Cat 3", "#ff8c00"),
+    (83,  "Cat 2", "#ffc000"),
+    (64,  "Cat 1", "#ffe521"),
+    (34,  "Trop. Storm", "#34c759"),
+    (0,   "Trop. Depression", "#9aa0a6"),
+]
+
+
+def saffir(wind_kt):
+    """(label, color) for a max-sustained-wind value in knots (NaN -> depression bucket)."""
+    if wind_kt != wind_kt:  # NaN
+        return SAFFIR[-1][1], SAFFIR[-1][2]
+    for thr, label, color in SAFFIR:
+        if wind_kt >= thr:
+            return label, color
+    return SAFFIR[-1][1], SAFFIR[-1][2]
+
+
+def est_vmax_kt(mslp_hpa, wind_ms):
+    """Wind (kt) used for categorization.
+      CATEGORY='wind'     -> raw model 10 m wind. Honest, but a 0.25 deg grid can't resolve a
+                             hurricane core, so it reads ~2-3 categories low (even for analyses).
+      CATEGORY='estimate' -> ballpark Vmax from the storm's central-pressure DEPTH: inflate the
+                             MSLP deficit by INTENSITY_GAIN (to undo the coarse-grid smoothing),
+                             then apply the Atkinson-Holliday wind-pressure relation. Its 0.644
+                             power keeps shallow lows weak and boosts deep storms more -- an
+                             intensity-aware correction, NOT a calibrated intensity forecast."""
+    if CATEGORY == "wind":
+        return np.asarray(wind_ms) * 1.943844
+    deficit = np.maximum(1010.0 - np.asarray(mslp_hpa), 0.0) * INTENSITY_GAIN
+    return 6.7 * np.power(deficit, 0.644)
 
 
 def make_data_source():
@@ -273,18 +337,40 @@ def plot_tracks(truth, results):
             lat = paths[0, p, :, 0]
             lon = wrap_lon(paths[0, p, :, 1])
             m = ~np.isnan(lat) & ~np.isnan(lon)
-            if m.sum() > 2:
-                ax.plot(lon[m], lat[m], color=color, linestyle=style, linewidth=1.6,
-                        marker="x" if style != "-" else None, markersize=3,
-                        label=label if first else None, **tf)
-                first = False
+            if m.sum() <= 2:
+                continue
+            # the LINE encodes which model/source (thin when category markers are drawn on top)
+            ax.plot(lon[m], lat[m], color=color, linestyle=style,
+                    linewidth=1.3 if STRENGTH else 1.6, alpha=0.6 if STRENGTH else 1.0,
+                    marker=None if STRENGTH else ("x" if style != "-" else None), markersize=3,
+                    label=label if first else None, **tf)
+            first = False
+            if STRENGTH:
+                # the MARKERS encode (estimated) Saffir-Simpson category -- see est_vmax_kt/CATEGORY
+                vmax = est_vmax_kt(paths[0, p, m, 2] / 100.0, paths[0, p, m, 3])
+                ax.scatter(lon[m], lat[m], c=[saffir(w)[1] for w in vmax],
+                           s=24, edgecolors="black", linewidths=0.3, zorder=5, **tf)
 
     draw(truth, "black", "-.", f"{DATA_SOURCE.upper()} analysis (truth)")
     for name, paths in results.items():
         draw(paths, MODEL_COLOR.get(name, "tab:orange"), "-", f"{name.upper()} AI forecast")
-    ax.legend(loc="upper right", title="Cyclone tracks", fontsize=9)
+
+    leg1 = ax.legend(loc="upper right", title="Track (line = source)", fontsize=9)
+    ax.add_artist(leg1)
+    if STRENGTH:
+        from matplotlib.lines import Line2D
+        handles = [Line2D([0], [0], marker="o", linestyle="none", markerfacecolor=c,
+                          markeredgecolor="k", markersize=7, label=l)
+                   for (_, l, c) in reversed(SAFFIR)]
+        cat_title = (f"Marker = est. category (pressure ×{INTENSITY_GAIN:g})"
+                     if CATEGORY == "estimate" else "Marker = category (model wind)")
+        ax.legend(handles=handles, loc="lower left", fontsize=8, title=cat_title)
     title_models = " vs ".join(n.upper() for n in results)
     plt.title(f"AI Tropical Cyclone Tracks — {title_models}\n{START_TIME:%Y-%m-%d %HZ} → {end_time:%Y-%m-%d %HZ}")
+    if STRENGTH and CATEGORY == "estimate":
+        plt.figtext(0.5, 0.005, "Category = rough ballpark from central-pressure depth "
+                    "(resolution-corrected), not a calibrated intensity forecast.",
+                    ha="center", fontsize=7, style="italic")
     out = "outputs/cyclone_tracks.jpg"
     plt.savefig(out, bbox_inches="tight", dpi=200)
     print(f"[plot] saved {out}")
@@ -328,8 +414,8 @@ def plot_intensity(truth, results):
 
 
 def main():
-    print("[load] TC tracker (TCTrackerWuDuan)...")
-    tracker = TCTrackerWuDuan().to(device)
+    print(f"[load] TC tracker (vort_threshold={VORT_THRESHOLD:.2e})...")
+    tracker = SensitiveTCTracker(vort_threshold=VORT_THRESHOLD).to(device)
     tracker_lat = tracker.input_coords()["lat"]
     data = make_data_source()
 
