@@ -19,8 +19,11 @@ Any config below can be overridden via env vars (handy for quick experiments), e
   WX_COMPARE=fcn,pangu WX_START=2024-10-06T00:00 WX_NSTEPS=16 WX_TRUTH=True \
   WX_EXTENT=-100,-78,17,32 python cyclone_track.py
 
-Hardware notes (RTX 5080, 16 GB): FCN and Pangu fit and run on the GPU. Aurora (0.25 deg)
-is activation-bound and does NOT fit 16 GB even with weight offload -- needs ~24 GB+.
+Hardware notes (RTX 5080, 16 GB):
+  - FCN / FourCastNet: fits and runs fast on the GPU (~1 GB VRAM).
+  - Pangu: its 0.25 deg ONNX transformer OOMs sharing the 16 GB card, so it runs on the
+    CPU here (see CPU_MODELS) -- slower but fine; the GPU still runs the tracker.
+  - Aurora (0.25 deg): activation-bound, does NOT fit 16 GB even with weight offload (~24 GB+).
 """
 
 import os
@@ -37,13 +40,13 @@ import torch
 # ----------------------------------------------------------------------------
 # Configuration -- edit these (or override with WX_* env vars)
 # ----------------------------------------------------------------------------
-MODEL       = "fcn"           # single model: "fcn" | "pangu" | "sfno" | "aurora"
+MODEL       = "pangu"           # single model: "fcn" | "pangu" | "sfno" | "aurora"
 COMPARE     = []              # e.g. ["fcn", "pangu"] to overlay several models; [] -> just MODEL
 INTENSITY   = True            # also plot storm intensity (min pressure / max wind)
 USE_BF16    = True            # run torch models under bfloat16 autocast
 DATA_SOURCE = "gfs"           # "gfs" (live NOAA, archive ~2021->now) or "arco" (ERA5)
 START_TIME  = datetime(2026, 6, 5, 0)   # init time; GFS has 00/06/12/18Z cycles
-NSTEPS      = 40              # forecast steps; 6h each -> 16 = 4 days, 40 = 10 days
+NSTEPS      = 20              # forecast steps; 6h each -> 16 = 4 days, 40 = 10 days
 TRACK_TRUTH = False           # overlay analysis "truth" (only for past windows)
 MAP_EXTENT  = [-100, -78, 17, 32]    # [lon_min, lon_max, lat_min, lat_max] in [-180,180]
 
@@ -81,6 +84,47 @@ if device.type == "cuda":
 # earth2studio class name for each model key
 PX_CLASS = {"fcn": "FCN", "pangu": "Pangu6", "sfno": "SFNO", "aurora": "Aurora"}
 MODEL_COLOR = {"fcn": "tab:blue", "pangu": "tab:red", "sfno": "tab:green", "aurora": "tab:purple"}
+
+# Models too memory-heavy for a 16 GB GPU at 0.25 deg -> run on CPU (slower, uses RAM).
+# Pangu's ONNX transformer wants a full ~16 GB to itself and OOMs sharing the card.
+CPU_MODELS = {"pangu"}
+
+
+def device_for(name):
+    return torch.device("cpu") if name in CPU_MODELS else device
+
+
+def _patch_ort_low_vram():
+    """Rebuild earth2studio's ONNX sessions with (a) kSameAsRequested arena (avoids the
+    kNextPowerOfTwo over-allocation that OOMs on smaller GPUs) and (b) multi-threaded CPU
+    inference (earth2studio hardcodes 1 thread, which makes CPU runs very slow)."""
+    try:
+        import onnxruntime as ort
+        import earth2studio.models.px.pangu as pmod
+    except Exception:
+        return
+
+    def builder(onnx_file, dev=torch.device("cpu", 0)):
+        o = ort.SessionOptions()
+        o.enable_cpu_mem_arena = False
+        o.enable_mem_pattern = False
+        o.enable_mem_reuse = False
+        o.intra_op_num_threads = os.cpu_count() or 1   # use all cores on CPU
+        o.log_severity_level = 3
+        os.stat(onnx_file)
+        if dev.type == "cuda":
+            idx = dev.index if dev.index is not None else torch.cuda.current_device()
+            providers = [("CUDAExecutionProvider",
+                          {"device_id": idx, "arena_extend_strategy": "kSameAsRequested"}),
+                         "CPUExecutionProvider"]
+        else:
+            providers = ["CPUExecutionProvider"]
+        return ort.InferenceSession(onnx_file, sess_options=o, providers=providers)
+
+    pmod.create_ort_session = builder
+
+
+_patch_ort_low_vram()
 
 
 def make_data_source():
@@ -131,9 +175,10 @@ def run_truth(tracker, tracker_lat, data):
 def run_forecast(name, tracker, tracker_lat, data):
     """Load one model, roll it forward, track each step. Returns tracks ndarray [1,P,T,4]."""
     cls_name = PX_CLASS[name]
-    print(f"\n=== Forecast: {name.upper()} ({cls_name}) ===")
+    mdev = device_for(name)
+    print(f"\n=== Forecast: {name.upper()} ({cls_name}) on {mdev.type.upper()} ===")
     px_cls = getattr(importlib.import_module("earth2studio.models.px"), cls_name)
-    prognostic = px_cls.load_model(px_cls.load_default_package()).to(device)
+    prognostic = px_cls.load_model(px_cls.load_default_package()).to(mdev)
     model_lat = prognostic.input_coords()["lat"]
 
     tracker.reset_path_buffer()
@@ -142,23 +187,24 @@ def run_forecast(name, tracker, tracker_lat, data):
         time=to_time_array([START_TIME]),
         variable=prognostic.input_coords()["variable"],
         lead_time=prognostic.input_coords()["lead_time"],
-        device=device,
+        device=mdev,
     )
     x, coords = fit_lat(x, coords, model_lat)
 
     amp = (torch.autocast("cuda", dtype=torch.bfloat16)
-           if (USE_BF16 and device.type == "cuda") else contextlib.nullcontext())
+           if (USE_BF16 and mdev.type == "cuda") else contextlib.nullcontext())
     iterator = prognostic.create_iterator(x, coords)
     output = None
     with amp:
         for step, (xo, co) in enumerate(iterator):
-            xm, cm = fit_lat(xo.float(), co, tracker_lat)
+            xo = xo.float().to(device)                      # tracker (cupy) runs on the GPU
+            xm, cm = fit_lat(xo, co, tracker_lat)
             xm, cm = map_coords(xm, cm, tracker.input_coords())
             output, _ = tracker(xm, cm)
             output = output[:, 0]
             _free_gpu()
-            mem = torch.cuda.max_memory_allocated() / 1e9 if device.type == "cuda" else 0
-            print(f"  step {step:2d}  +{6*step:>4}h  tracks {tuple(output.shape)}  peakVRAM {mem:.1f}GB")
+            tag = ("peakVRAM %.1fGB" % (torch.cuda.max_memory_allocated() / 1e9)) if device.type == "cuda" else ""
+            print(f"  step {step:2d}  +{6*step:>4}h  tracks {tuple(output.shape)}  {tag}")
             if step == NSTEPS:
                 break
     del prognostic

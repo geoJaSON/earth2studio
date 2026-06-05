@@ -1,39 +1,76 @@
 # Local AI Weather — Tropical Cyclone Forecasting (NVIDIA earth2studio)
 
 Run global AI weather forecast models **locally** on an RTX 5080 (16 GB) and extract
-**tropical-cyclone tracks**, comparing an AI forecast against analysis "truth".
+**tropical-cyclone tracks and intensity**, comparing one or more AI forecasts against
+analysis "truth".
 
-Working demo: a 4-day **FourCastNet (FCN)** forecast initialized from **live NOAA GFS**
-data, tracking **Typhoon Jangmi** (W. Pacific, late May 2026). See
-[`outputs/cyclone_tracks.jpg`](outputs/cyclone_tracks.jpg).
+Working demos:
+- a 4-day **FCN** forecast from **live GFS** tracking **Typhoon Jangmi** (W. Pacific);
+- a 3-day **FCN vs Pangu** comparison of **Hurricane Milton** in the Gulf of Mexico,
+  with an intensity (min-pressure / max-wind) panel.
+
+See [`outputs/cyclone_tracks.jpg`](outputs/cyclone_tracks.jpg) and
+[`outputs/intensity.png`](outputs/intensity.png).
 
 ## What's installed
 
 - conda env **`earth2`** (Python 3.12) at `~/miniconda3/envs/earth2`
 - **PyTorch 2.11.0 + CUDA 12.8** (required for Blackwell / RTX 5080 `sm_120`)
-- **earth2studio** (NVIDIA) with the `cyclone` + `fcn` model stacks
-- forecast model: **FCN / FourCastNet** (light, ~1 GB VRAM); tracker: **TCTrackerWuDuan**
+- **earth2studio** (NVIDIA) with the `cyclone`, `fcn`, and Pangu (`onnxruntime-gpu`) stacks
+- models: **FCN / FourCastNet** (GPU, ~1 GB) and **Pangu-Weather** (CPU; see below);
+  tracker: **TCTrackerWuDuan**
 - data sources: **GFS** (live, no account) and **ARCO ERA5** (historical, no account)
+
+## Replicate on another machine
+
+One script rebuilds the whole environment (Linux + NVIDIA GPU, `conda` on PATH):
+
+```bash
+bash setup.sh            # creates conda env 'earth2'  (or: bash setup.sh myenv)
+```
+
+It pins the exact versions and bakes in the non-obvious fixes (cu128 wheels, the
+torchvision re-pin, the cupy/cucim CUDA-13→12 swap — see notes below), then verifies
+the GPU and all imports. For a non-Blackwell GPU you can pick a different CUDA build:
+
+```bash
+CUDA_IDX=https://download.pytorch.org/whl/cu124 bash setup.sh
+```
+
+[`requirements-freeze.txt`](requirements-freeze.txt) is an exact `pip freeze` of the
+working env (reference lock / for debugging a version regression). Copy `setup.sh`,
+`requirements-freeze.txt`, and `cyclone_track.py` to the new machine.
 
 ## Run it
 
 ```bash
 ~/miniconda3/envs/earth2/bin/python cyclone_track.py
-# output -> outputs/cyclone_tracks.jpg  (+ ai_paths.pt / truth_paths.pt)
+# -> outputs/cyclone_tracks.jpg, outputs/intensity.png, outputs/<model>_paths.npy
 ```
 
 Edit the config block at the top of [`cyclone_track.py`](cyclone_track.py):
 
 | Setting | Meaning |
 |---|---|
-| `MODEL` | `"fcn"` (fits 16 GB), `"sfno"` (needs `makani`), `"aurora"` (needs >16 GB) |
-| `DATA_SOURCE` | `"gfs"` (live, recent dates) or `"arco"` (ERA5, any historical date) |
+| `MODEL` | single model: `"fcn"` \| `"pangu"` \| `"sfno"` \| `"aurora"` |
+| `COMPARE` | list to overlay several models, e.g. `["fcn", "pangu"]` (`[]` = just `MODEL`) |
+| `INTENSITY` | `True` → also plot min-pressure / max-wind of the primary storm |
+| `DATA_SOURCE` | `"gfs"` (live, ~2021→now) or `"arco"` (ERA5, any historical date) |
 | `START_TIME` | init time; GFS only has 00/06/12/18Z cycles |
-| `NSTEPS` | forecast steps (6 h each; 16 = 4 days) |
-| `MAP_EXTENT` | `[lon_min, lon_max, lat_min, lat_max]` plot window |
+| `NSTEPS` | forecast steps (6 h each; 16 = 4 days, 40 = 10 days) |
+| `TRACK_TRUTH` | overlay analysis "truth" (only for *past* windows) |
+| `MAP_EXTENT` | `[lon_min, lon_max, lat_min, lat_max]` in `[-180,180]` |
 
-To forecast a **different / current storm**: keep `DATA_SOURCE="gfs"`, set `START_TIME`
-to a recent cycle, and set `MAP_EXTENT` over the basin of interest.
+Any setting is also overridable via `WX_*` env vars (no file edit needed), e.g. the
+Milton comparison:
+
+```bash
+WX_COMPARE=fcn,pangu WX_START=2024-10-06T00:00 WX_NSTEPS=12 WX_TRUTH=True \
+WX_EXTENT=-100,-78,17,32 ~/miniconda3/envs/earth2/bin/python cyclone_track.py
+```
+
+To forecast a **current** storm: `DATA_SOURCE="gfs"`, `START_TIME` = latest cycle,
+`TRACK_TRUTH=False` (the future has no analysis yet), `MAP_EXTENT` over the basin.
 
 ## Hard-won setup notes (Blackwell / 16 GB gotchas)
 
@@ -59,20 +96,30 @@ These were the non-obvious fixes — keep them if you rebuild the env:
 6. **Data-source variable gaps.** FCN needs relative humidity (`r500`, `r850`),
    which **ARCO ERA5 lacks** but **GFS has** — hence the GFS demo. Always check
    `model.input_coords()["variable"]` vs the source lexicon.
+7. **Pangu (ONNX) on a shared GPU.** earth2studio's ORT session uses the default
+   `kNextPowerOfTwo` arena, which over-allocates and OOMs even with free VRAM; and it
+   hardcodes 1 CPU thread. `_patch_ort_low_vram()` rebuilds the session with
+   `kSameAsRequested` + all CPU cores. Even so, Pangu's 0.25° transformer won't share
+   16 GB with the framework → it runs on **CPU** (`CPU_MODELS`); the GPU runs the tracker.
 
 ## Model options for this 16 GB card
 
-| Model | Fits 16 GB? | Notes |
+| Model | On 16 GB | Notes |
 |---|---|---|
-| **FCN / FourCastNet** | ✅ ~1 GB | used here; needs RH → use GFS (or CDS ERA5) |
-| **SFNO / FourCastNet-v2** | ✅ (light) | needs `makani` from git (not on PyPI) |
-| **Pangu-Weather** | ✅ | ONNX; strong TC tracks; GPU on Blackwell is uncertain |
-| **Aurora** (0.25°) | ❌ OOM (~24 GB+) | best TC model; also bf16 breaks its lon check |
+| **FCN / FourCastNet** | ✅ GPU ~1 GB | fast; needs RH → use GFS (or CDS ERA5) |
+| **Pangu-Weather** | ⚠️ CPU only | great TC tracks; ONNX OOMs sharing the GPU → CPU (~30 s/step) |
+| **SFNO / FourCastNet-v2** | ✅ GPU (light) | needs `makani` from git (not on PyPI) |
+| **Aurora** (0.25°) | ❌ ~24 GB+ | best TC model; activation-bound, offload doesn't help |
 | **GraphCast / GenCast** | ⚠️ | JAX on CUDA-13; heavier |
+
+## Note on intensity
+
+AI models track cyclones well but **systematically under-deepen** them: in the Milton
+demo the GFS analysis bottomed near ~942 hPa / 78 kt while FCN and Pangu kept it near
+~1000 hPa / 30 kt. Treat the intensity panel as *relative* guidance, not a Cat rating.
 
 ## Ideas to extend
 
-- Swap in **SFNO** (install `makani` from git) or **Pangu** for a model comparison.
-- Forecast the **current** storm: set `START_TIME` to today's latest GFS cycle and
-  remove/extend the analysis "truth" loop (no truth exists for the future).
-- Save full forecast fields (not just tracks) and plot intensity (min MSLP / max wind).
+- Add **SFNO** (install `makani` from git) to the `COMPARE` list for a 3-model panel.
+- Save full forecast fields (not just tracks) and map wind/pressure at landfall.
+- Drive a **live** daily run from the latest GFS cycle (`TRACK_TRUTH=False`).
